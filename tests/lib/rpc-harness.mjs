@@ -3,8 +3,9 @@
  * Provides spawn, send, event waiting, and text collection utilities.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execPath } from "node:process";
+import { delimiter, dirname, resolve } from "node:path";
 import { getClaudeDir } from "cc-session-io";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
@@ -41,6 +42,25 @@ try {
 	);
 }
 
+/** Spawn target for the globally-installed pi CLI: [command, leading args]. */
+function resolvePiEntry() {
+	// npm puts its shims directly beside the node_modules tree they point into, so
+	// the PATH directory holding `pi` also tells us where the package lives.
+	// Globally-installed packages are not on node's module resolution path.
+	const shims = process.platform === "win32" ? ["pi.cmd", "pi.exe", "pi"] : ["pi"];
+	for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+		if (!dir || !shims.some((n) => existsSync(resolve(dir, n)))) continue;
+		const pkg = resolve(dir, "node_modules/@earendil-works/pi-coding-agent/package.json");
+		if (!existsSync(pkg)) continue;
+		try {
+			const bin = JSON.parse(readFileSync(pkg, "utf8")).bin;
+			const rel = typeof bin === "string" ? bin : bin?.pi;
+			if (rel) return [execPath, [resolve(dirname(pkg), rel)]];
+		} catch {}
+	}
+	return [process.platform === "win32" ? "pi.cmd" : "pi", []];
+}
+
 /**
  * Create an RPC harness for pi integration tests.
  *
@@ -50,9 +70,12 @@ try {
  * @param {Object} opts.env - Extra env vars to set on the pi process
  * @param {string} opts.cwd - Working directory for the pi process (default: project root)
  * @param {number} opts.defaultTimeout - Default timeout for send/wait operations (default: 30000)
+ * @param {string[]} opts.extensions - Extensions to load, in order (default: this repo alone).
+ *   Order is load order, and an extension loaded after the bridge sees a different
+ *   world than one loaded before it.
  */
 export function createRpcHarness(opts) {
-	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000 } = opts;
+	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000, extensions = [DIR] } = opts;
 
 	const LOGDIR = `${DIR}/.test-output`;
 	mkdirSync(LOGDIR, { recursive: true });
@@ -61,7 +84,14 @@ export function createRpcHarness(opts) {
 	const DEBUG_LOG = `${LOGDIR}/${name}-debug.log`;
 
 	// Strip any local node_modules from PATH so we use the globally-installed `pi`.
-	const cleanPath = process.env.PATH.split(":").filter((p) => !p.includes("node_modules")).join(":");
+	// Split on the platform delimiter: on Windows `:` sits inside every drive letter,
+	// so splitting on it shreds PATH and every spawn below fails with ENOENT.
+	const cleanPath = process.env.PATH.split(delimiter).filter((p) => !p.includes("node_modules")).join(delimiter);
+	// npm installs `pi` as a .cmd shim on Windows, which spawn() will not run without
+	// a shell (CVE-2024-27980 hardening) and which PATHEXT lookup does not find either.
+	// Resolving the package's own entry point spawns node directly on both platforms,
+	// with no shell quoting in the way.
+	const [piCmd, piPrefixArgs] = resolvePiEntry();
 
 	let pi, rpcLog;
 	let stopped = false;
@@ -76,8 +106,9 @@ export function createRpcHarness(opts) {
 		writeFileSync(DEBUG_LOG, "");
 		stopped = false;
 		rpcLog = createWriteStream(RPC_LOG, { flags: "a" });
-		const spawnArgs = ["--no-session", "-ne", "-e", DIR, "--mode", "rpc", ...args];
-		pi = spawn("pi", spawnArgs, {
+		const extArgs = extensions.flatMap((e) => ["-e", e]);
+		const spawnArgs = [...piPrefixArgs, "--no-session", "-ne", ...extArgs, "--mode", "rpc", ...args];
+		pi = spawn(piCmd, spawnArgs, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			env: { ...process.env, PATH: cleanPath, CLAUDE_BRIDGE_DEBUG: "1", CLAUDE_BRIDGE_DEBUG_PATH: DEBUG_LOG, ...env },
