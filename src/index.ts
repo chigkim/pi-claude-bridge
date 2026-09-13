@@ -23,6 +23,7 @@ import {
 	projectPromptCapture,
 	PromptCaptures,
 } from "./prompt-capture.js";
+import { basePromptKey } from "./base-prompt.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -2122,10 +2123,14 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event) => {
 		const options = event.systemPromptOptions;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(event.systemPrompt, {
+		// Equal lengths mean we are keying on the prompt we were handed: either nothing
+		// wrapped it, or pi's own prompt could not be reproduced to key on instead.
+		const key = await basePromptKey(event.systemPrompt, options);
+		debug(`prompt-capture: recorded ${key.length}-char key from the ${event.systemPrompt.length}-char prompt handed to us`);
+		promptCaptures.record(key, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
