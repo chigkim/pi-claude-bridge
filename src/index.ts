@@ -224,11 +224,6 @@ interface SessionState {
 	// this — there's no concurrent CC writer during those events, so
 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
-	// pi replaced its history (compact, tree) rather than appended to it. Unlike
-	// needsRebuild, which only syncSharedSession reads, this is read on the
-	// tool-result path — the one call that never syncs — so a query parked at a
-	// tool boundary is discarded instead of resumed. Cleared once acted on.
-	historyRewritten?: boolean;
 }
 
 /**
@@ -253,6 +248,19 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 }
 
 let sharedSession: SessionState | null = null;
+
+// pi replaced its history (compact, tree) rather than appending to it. Read on
+// the tool-result path — the one call that never syncs — so a query parked at a
+// tool boundary is discarded instead of resumed. Not a field on sharedSession:
+// that stays null until a query *completes*, so a first turn long enough to
+// compact would leave the flag nowhere to live and the discard would never fire.
+let historyRewritten = false;
+
+function markRebuild(event: string) {
+	historyRewritten = true;
+	debug(`${event}: history rewritten, session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
+	if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true };
+}
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
@@ -750,7 +758,10 @@ function syncSharedSession(
 export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
+		historyRewritten = false;
 	},
+	markRebuild,
+	getHistoryRewritten: () => historyRewritten,
 	setSharedSession(state: SessionState | null) {
 		sharedSession = state;
 	},
@@ -1539,10 +1550,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// pi rewrote its history while this query sat parked at a tool boundary, so the
 	// query answers about a conversation that no longer exists. Discard it and let
 	// the result carry the turn into a fresh query over the rewritten history.
-	const rewrittenUnderQuery = Boolean(resultCtx && sharedSession?.historyRewritten);
+	const rewrittenUnderQuery = Boolean(resultCtx && historyRewritten);
 	if (resultCtx && rewrittenUnderQuery) {
 		discardRewrittenQuery(resultCtx);
-		sharedSession = { ...sharedSession!, historyRewritten: false };
+		historyRewritten = false;
 		resultCtx = undefined;
 		// Recomputed, not cleared: a reentrant subagent may still hold the top-level query.
 		activeQuery = ctx().activeQuery !== null;
@@ -1638,6 +1649,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = claudeCodeModelId(model, longContextSettings);
 	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
+	// This query starts from the history pi has now; left set, the flag would
+	// discard the first tool result of a query that was never stale.
+	if (!isReentrant) historyRewritten = false;
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -2087,6 +2101,7 @@ export default function (pi: ExtensionAPI) {
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
+		historyRewritten = false;
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2162,12 +2177,6 @@ export default function (pi: ExtensionAPI) {
 	// session that no longer matches pi's history. /compact in particular
 	// triggers CC's autocompact-thrashing guard (issue #8). Force the next
 	// call down the REBUILD path so CC sees the current history.
-	const markRebuild = (event: string) => {
-		if (sharedSession) {
-			debug(`${event}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
-			sharedSession = { ...sharedSession, needsRebuild: true, historyRewritten: true };
-		}
-	};
 	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
 	pi.on("session_tree", () => markRebuild("session_tree"));
 

@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { QueryContext } from "../src/query-state.js";
 
 const { __test } = await import("../src/index.js");
-const { discardRewrittenQuery, contextForToolResults, activeQueryContexts, isQueryAbandoned } = __test;
+const { discardRewrittenQuery, contextForToolResults, activeQueryContexts, isQueryAbandoned, markRebuild, getHistoryRewritten, resetSharedSession, setSharedSession, getSharedSession } = __test;
 
 /** A query parked mid-turn: CC asked for a tool and is waiting on the answer. */
 function parkedQuery(toolCallId = "call_1") {
@@ -38,6 +38,30 @@ function parkedQuery(toolCallId = "call_1") {
 	activeQueryContexts.add(c);
 	return { c, sdkQuery, events };
 }
+
+describe("markRebuild", () => {
+	beforeEach(() => resetSharedSession());
+
+	it("records the rewrite when no CC session exists yet", () => {
+		// sharedSession is only assigned when a query completes, so it is null for
+		// the whole of a first turn — and a first turn is long enough to compact.
+		assert.equal(getSharedSession(), null, "precondition: nothing has completed yet");
+
+		markRebuild("session_compact:threshold");
+
+		assert.equal(getHistoryRewritten(), true,
+			"dropped here, the parked query survives the compaction and pi compacts again at every boundary");
+	});
+
+	it("also forces the next call down the rebuild path once a session is known", () => {
+		setSharedSession({ sessionId: "abc", cursor: 3, cwd: "/tmp", needsRebuild: false });
+
+		markRebuild("session_tree");
+
+		assert.equal(getHistoryRewritten(), true);
+		assert.equal(getSharedSession().needsRebuild, true, "--resume would replay a history pi no longer has");
+	});
+});
 
 describe("discardRewrittenQuery", () => {
 	beforeEach(() => { activeQueryContexts.clear(); });
