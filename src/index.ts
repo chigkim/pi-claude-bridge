@@ -21,6 +21,7 @@ import {
 	projectPromptCapture,
 	sharedPromptCaptures,
 } from "./prompt-capture.js";
+import { basePromptKey } from "./base-prompt.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -2210,19 +2211,25 @@ export default function (pi: ExtensionAPI) {
 		contextFiles?: { path: string; content: string }[];
 		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
 		selectedTools?: string[];
-	} | undefined) {
+	} | undefined, key?: string) {
 		if (!systemPrompt) return;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(systemPrompt, {
+		promptCaptures.record(key ?? systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
 		}, source);
 	}
-	pi.on("before_agent_start", (event) => {
+	// Keyed on pi's own prompt, not on what an earlier extension made of it: pi still runs
+	// turns on its unwrapped prompt, and a wrapper's text is not in the capture anyway. The
+	// wrapped prompt then resolves through resolveOrDerive's embed path, which carries every
+	// surrounding byte through unchanged. Equal lengths mean the base could not be rebuilt.
+	pi.on("before_agent_start", async (event) => {
 		lastSystemPromptOptions = event.systemPromptOptions;
-		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
+		const key = await basePromptKey(event.systemPrompt, event.systemPromptOptions);
+		debug(`prompt-capture: recorded ${key.length}-char key from the ${event.systemPrompt.length}-char prompt handed to us`);
+		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions, key);
 	});
 	// The prompt the provider actually queries with is the fully-widened one: MCP tool
 	// descriptions merge into the system prompt only after their servers connect, which
