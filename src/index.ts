@@ -13,7 +13,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
-import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
+import { findParentChainBreak, verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -216,14 +216,19 @@ interface SessionState {
 	// navigation) or after an abort left the JSONL in an indeterminate state.
 	// REBUILD wipes and rewrites the file to match pi's current history.
 	needsRebuild?: boolean;
-	// Set ONLY after an abort. The killed CC subprocess may still be flushing
-	// a late "[Request interrupted by user]" record to the session JSONL.
-	// Reusing the same sessionId/path would race that orphan write into our
-	// fresh file and break CC's parent-uuid chain on the next resume. When
-	// this flag is set, REBUILD takes a fresh UUID and skips deleteSession
-	// so the orphan writes land on a dead inode. Compact/tree do NOT set
-	// this — there's no concurrent CC writer during those events, so
-	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
+	// Set whenever a live CC subprocess was torn down under us. The killed
+	// subprocess may still be flushing a late "[Request interrupted by user]"
+	// record to the session JSONL. Reusing the same sessionId/path would race
+	// that orphan write into our fresh file and break CC's parent-uuid chain on
+	// the next resume. When this flag is set, REBUILD takes a fresh UUID and
+	// skips deleteSession so the orphan writes land on a dead inode.
+	//
+	// Set by an abort, and by discardRewrittenQuery — compaction at a tool
+	// boundary interrupts a parked query, which is the same concurrent writer.
+	// An earlier version of this comment claimed compact/tree could not produce
+	// one; that was true only before the parked-query discard existed (#101),
+	// and skipping the rotation orphaned the whole rebuilt prefix, compaction
+	// summary included, behind a dangling parent uuid.
 	forceRotate?: boolean;
 }
 
@@ -246,6 +251,33 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 		debug(`WARNING: could not read attachments from session ${sessionId.slice(0, 8)}:`, error);
 		return [];
 	}
+}
+
+/**
+ * Whether a session is safe to resume: Claude Code replays only the records its
+ * `parentUuid` chain reaches walking back from the leaf, so a break makes
+ * everything before it invisible to the model with nothing in the stream to say
+ * so. Unreadable files report intact — the rebuild path handles those, and a
+ * read error is not evidence of a break.
+ *
+ * Costs one full read + parse of the session file per fresh query. Measured at
+ * ~9ms on the largest real session on hand (913KB / 447 records) and ~42ms on a
+ * synthetic 10MB / 5000-record one; the walk itself is ~0.1ms, so this is read
+ * cost, not algorithm cost, and it is noise against the round trip it guards.
+ */
+function resumeChainIsIntact(sessionId: string, cwd: string): boolean {
+	let records;
+	try {
+		records = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }).records;
+	} catch (error) {
+		debug(`WARNING: could not read session ${sessionId.slice(0, 8)} to check its parent chain:`, error);
+		return true;
+	}
+	const chainBreak = findParentChainBreak(records as unknown as Array<Record<string, any>>);
+	if (!chainBreak) return true;
+	debug(`WARNING resume chain: ${chainBreak} — session ${sessionId.slice(0, 8)}; rebuilding and rotating instead of resuming`);
+	diagDump("resume_chain_break", { sessionId: sessionId.slice(0, 8), cwd, detail: chainBreak });
+	return false;
 }
 
 let sharedSession: SessionState | null = null;
@@ -686,9 +718,18 @@ function syncSharedSession(
 			if (trailingAssistantOnly) {
 				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
 			}
-			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-			return { sessionId: sharedSession.sessionId };
+			// A file we wrote is connected by construction; a file an orphaned CC
+			// subprocess has since appended to may not be, and CC replays only what
+			// the parent chain reaches from the leaf. Resuming a broken one silently
+			// drops the records before the break. Rebuild instead — and rotate,
+			// because whatever appended may still be writing.
+			if (!resumeChainIsIntact(sharedSession.sessionId, sharedSession.cwd ?? cwd)) {
+				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			} else {
+				debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+				debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+				return { sessionId: sharedSession.sessionId };
+			}
 		}
 	}
 	// This is what keeps a reentrant subagent from taking over the parent's
@@ -1531,7 +1572,18 @@ function discardRewrittenQuery(c: QueryContext): void {
 	c.releasePendingToolCalls("Conversation was compacted; this query was discarded.");
 	void discarded?.interrupt?.().catch(() => {});
 	try { discarded?.close?.(); } catch {}
-	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
+	// Interrupting a live CC subprocess makes it a concurrent writer on the
+	// session JSONL: it flushes its own "[Request interrupted by user]" record,
+	// parented on a uuid from the conversation we are about to replace. An
+	// in-place rebuild (deleteSession + createSession on the same id) recreates
+	// the file underneath it, so that record lands in the new file naming a
+	// parent no record defines. CC resumes by walking parentUuid from the leaf,
+	// stops at the dangling link, and every record before it — the compaction
+	// summary and the entire kept tail — never reaches the API. Rotate instead,
+	// which takes a fresh uuid and leaves the old file for the orphan to finish
+	// writing into.
+	if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+	debug("provider: history rewritten under a parked query — discarded it, rotating session, rebuilding from current history");
 }
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
