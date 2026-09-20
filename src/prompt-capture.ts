@@ -157,6 +157,26 @@ export class PromptCaptures {
 
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
 		if (embedded.length === 0) {
+			// The mirror image of the embed case: a known key that *starts with* this
+			// prompt. Pi assembles the turn prompt two different ways. Normally
+			// `context.messages` carries an ephemeral system message holding the whole
+			// assembled string, extension appends and all, which is what we recorded.
+			// But a turn woken while the agent was idle — a background-task
+			// notification is the one observed trigger — is served from the persisted
+			// transcript instead, whose system messages carry only pi's own named
+			// sections. Extension text is not a section, so the prompt arrives as our
+			// key minus its tail.
+			//
+			// Every portable part we project (context files, skills, custom, append)
+			// comes from the recorded `systemPromptOptions`, not from the tail, so the
+			// capture still applies in full. Throwing here failed the turn over text
+			// pi itself chose to drop.
+			const truncated = this.findTruncatedParent(systemPrompt);
+			if (truncated) {
+				this.touch(truncated.assembledPrompt, truncated);
+				return truncated;
+			}
+
 			const matches = this.closestKnown(systemPrompt);
 			const hint = this.onDiagnose({ systemPrompt, matches });
 			throw new Error(
@@ -178,6 +198,33 @@ export class PromptCaptures {
 
 	get size(): number {
 		return this.captures.size;
+	}
+
+	/** The capture whose key this prompt is a strict prefix of, if exactly one
+	 *  family matches.
+	 *
+	 *  Shortest key wins: with a parent and a sub-agent prompt built on top of it,
+	 *  both start with the same text, and the shortest is the one that added least
+	 *  beyond what pi handed us. Ambiguity between two unrelated keys returns
+	 *  nothing and lets the caller throw — guessing which agent's context files to
+	 *  send is the silent loss this class exists to prevent. */
+	private findTruncatedParent(systemPrompt: string): PromptCapture | undefined {
+		if (systemPrompt.length === 0) return undefined;
+		let best: PromptCapture | undefined;
+		for (const node of this.reachableCaptures()) {
+			const key = node.assembledPrompt;
+			if (key.length <= systemPrompt.length || !key.startsWith(systemPrompt)) continue;
+			if (!best) {
+				best = node;
+				continue;
+			}
+			if (node === best) continue;
+			// A shorter key that the longer one also extends is the same family, so
+			// prefer it; two keys that diverge after the prompt are genuinely ambiguous.
+			if (best.assembledPrompt.startsWith(key)) best = node;
+			else if (!key.startsWith(best.assembledPrompt)) return undefined;
+		}
+		return best;
 	}
 
 	/** Longest shared-prefix matches, best first, for the throw diagnostic. */

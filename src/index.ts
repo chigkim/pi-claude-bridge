@@ -626,15 +626,38 @@ async function runIsolatedSummary(
 	}
 }
 
+/** Cap on how many prior-compaction file paths we carry into the next summary.
+ *  Each compaction records the files it was handed *plus* everything the previous one
+ *  knew, so re-injecting the whole list unions a union: it can only grow. One observed
+ *  session climbed 62 -> 99 modified paths over 15 compactions and was still going.
+ *  The newest paths are the ones a summary can still act on, so we trim the oldest. */
+const MAX_REINJECTED_FILE_OPS = 64;
+
+/** Add prior paths newest-first until `target` reaches the cap; returns how many landed.
+ *  Paths from the current turn are already in `target` and are never evicted. */
+function addNewestFileOps(target: Set<string>, prior: unknown[]): number {
+	let added = 0;
+	for (let i = prior.length - 1; i >= 0 && target.size < MAX_REINJECTED_FILE_OPS; i--) {
+		const file = String(prior[i]);
+		if (target.has(file)) continue;
+		target.add(file);
+		added++;
+	}
+	return added;
+}
+
 function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
 	const prior = [...branchEntries]
 		.reverse()
 		.find((entry): entry is CompactionEntry => entry.type === "compaction");
 	const details = prior?.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
 	if (!Array.isArray(details?.readFiles) || !Array.isArray(details?.modifiedFiles)) return;
-	for (const file of details.readFiles) preparation.fileOps.read.add(String(file));
-	for (const file of details.modifiedFiles) preparation.fileOps.edited.add(String(file));
-	debug(`compact takeover: re-injected prior file ops read=${details.readFiles.length} modified=${details.modifiedFiles.length}`);
+	const read = addNewestFileOps(preparation.fileOps.read, details.readFiles);
+	const edited = addNewestFileOps(preparation.fileOps.edited, details.modifiedFiles);
+	debug(
+		`compact takeover: re-injected prior file ops read=${read}/${details.readFiles.length} ` +
+		`modified=${edited}/${details.modifiedFiles.length} (cap ${MAX_REINJECTED_FILE_OPS})`,
+	);
 }
 
 interface SyncResult {
@@ -869,6 +892,8 @@ export const __test = {
 	CC_CHILD_ENV,
 	buildMcpServers,
 	branchSummaryOutcome,
+	reinjectPriorCompactionFileOps,
+	MAX_REINJECTED_FILE_OPS,
 };
 
 // --- Provider helpers: tool name mapping ---

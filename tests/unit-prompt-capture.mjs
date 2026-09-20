@@ -258,4 +258,50 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolve("a").custom, "refreshed");
 		assert.ok(captures.resolve("c") && captures.resolve("d"));
 	});
+
+	it("resolves a turn prompt that pi truncated to its own sections", () => {
+		// Observed live: pi serves a turn woken by a background-task notification
+		// from the persisted transcript, whose system messages carry only pi's named
+		// sections. An extension's appended block is not a section, so the prompt
+		// arrives as the recorded key minus that tail and matched nothing.
+		const captures = new PromptCaptures();
+		const EXTENSION_APPEND = "\n\n<memory-policy>\nPersistent memory is available.\n</memory-policy>";
+		captures.record(`${PARENT_KEY}${EXTENSION_APPEND}`, capture({
+			contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }],
+			skills: [skill("deploy")],
+		}));
+
+		const resolved = captures.resolveOrDerive(PARENT_KEY);
+		assert.ok(resolved, "sections-only prompt should resolve to the recorded capture");
+		assert.deepEqual(resolved.contextFiles, [{ path: "/AGENTS.md", content: "parent rules" }]);
+		assert.equal(resolved.skills.length, 1);
+		const text = projectPromptCapture(resolved, { skillReadTool: "mcp" });
+		assert.ok(text.includes("parent rules"), "context files must survive the truncated turn");
+	});
+
+	it("prefers the shortest key when a truncated prompt matches a whole family", () => {
+		const captures = new PromptCaptures();
+		// A nested family: the child key extends the parent key, so both start with
+		// the truncated prompt. The shortest added least beyond what pi handed us.
+		const PARENT_APPENDED = `${PARENT_KEY}
+
+appended`;
+		captures.record(PARENT_APPENDED, capture({ contextFiles: [{ path: "/p.md", content: "parent" }] }));
+		captures.record(`${PARENT_APPENDED}${CHILD_SUFFIX}`, capture({ contextFiles: [{ path: "/c.md", content: "child" }] }));
+
+		const resolved = captures.resolveOrDerive(PARENT_KEY);
+		assert.ok(resolved);
+		assert.deepEqual(resolved.contextFiles, [{ path: "/p.md", content: "parent" }]);
+	});
+
+	it("still throws when a truncated prompt is ambiguous between families", () => {
+		// Two keys that both extend the prompt but diverge from each other: picking
+		// one would send another agent's context files, which is the silent loss the
+		// throw exists to prevent.
+		const captures = new PromptCaptures();
+		captures.record(`${PARENT_KEY}\n\n<a>alpha</a>`, capture({ contextFiles: [{ path: "/a.md", content: "a" }] }));
+		captures.record(`${PARENT_KEY}\n\n<b>beta</b>`, capture({ contextFiles: [{ path: "/b.md", content: "b" }] }));
+
+		assert.throws(() => captures.resolveOrDerive(PARENT_KEY), /no capture for this/);
+	});
 });
