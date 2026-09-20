@@ -58,7 +58,7 @@ if (Number.isNaN(since) || Number.isNaN(ceiling)) {
 	process.exit(2);
 }
 const logPath = args.filter((a, i) => !a.startsWith("--") && !args[i - 1]?.startsWith("--"))[0]
-	?? join(homedir(), ".pi/agent/claude-bridge.log");
+	?? join(homedir(), ".pi/agent/logs/claude-bridge.log");
 
 // A turn emits several `usage:` lines reporting the same request as its output
 // grows. Collapsing runs that share (cacheRead, cacheWrite, model) leaves one row

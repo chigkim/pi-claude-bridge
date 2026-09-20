@@ -17,7 +17,7 @@ import { findParentChainBreak, verifyWrittenSession as _verifyWrittenSession } f
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
-import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { claudeCodeSettings, globalConfigPath, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
 	collectPromptSkills,
 	projectPromptCapture,
@@ -36,11 +36,19 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
+// CLAUDE_BRIDGE_DEBUG=1, or `"debug": true` in claude-bridge.json, enables debug
+// logging to ~/.pi/agent/logs/. The env var is read here at module load;
+// the config setting arrives later, at extension registration, via setDebugEnabled.
 
-const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
+let DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
+// Everything the bridge writes for diagnosis lives under one directory, so a user can
+// hand over or delete the lot without picking bridge files out of ~/.pi/agent, which is
+// also where their settings and config live. CLAUDE_BRIDGE_DEBUG_PATH still points the
+// main log anywhere; the others follow its directory, as they always have.
+const LOG_DIR = join(homedir(), ".pi", "agent", "logs");
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(LOG_DIR, "claude-bridge.log");
+const DIAG_LOG_PATH = join(dirname(DEBUG_LOG_PATH), "claude-bridge-diag.log");
+const PROMPT_TRACE_PATH = join(dirname(DEBUG_LOG_PATH), "claude-bridge-prompts.jsonl");
 
 // CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
 // one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
@@ -75,13 +83,22 @@ const CC_CHILD_ENV = {
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
 // Ensure log directories exist when debug is enabled
-if (DEBUG) {
+function ensureLogDirs(): void {
 	try {
 		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
 		mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
 	} catch {
 		// If directory creation fails, debug functions will throw on first use
 	}
+}
+if (DEBUG) ensureLogDirs();
+
+/** Turn debug logging on from config. Only ever turns it on: a `false` in config must not
+ *  silence someone who deliberately exported CLAUDE_BRIDGE_DEBUG=1 for this one run. */
+function setDebugEnabled(enabled: boolean | undefined): void {
+	if (!enabled || DEBUG) return;
+	DEBUG = true;
+	ensureLogDirs();
 }
 
 // Unique per module evaluation — confirms whether subagents share module state
@@ -646,7 +663,9 @@ function verifyWrittenSession(
 			`Session file issue: ${msg}\n` +
 			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
 			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
-			(DEBUG ? ` and attach ${DEBUG_LOG_PATH}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
+			(DEBUG
+				? ` and attach ${DEBUG_LOG_PATH}`
+				: ` (set "debug": true in ${globalConfigPath()}, or CLAUDE_BRIDGE_DEBUG=1, to capture a debug log)`),
 			"warning",
 		);
 		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
@@ -938,6 +957,11 @@ function showStartupNoticeOnce(): void {
 // is keyed rather than held in a single slot.
 const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
+	dumpPromptEvent("miss", () => ({
+		incomingLength: diagnostic.systemPrompt.length,
+		incoming: diagnostic.systemPrompt,
+		matches: diagnostic.matches.map((m) => ({ keyLength: m.key.length, firstDivergent: m.firstDivergent, key: m.key })),
+	}));
 	debug(
 		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
 		+ (first
@@ -946,6 +970,9 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 			: "no known captures to compare against."
 		) + ` known keys=${diagnostic.matches.length}`,
 	);
+	return DEBUG
+		? `Both prompts were written to ${PROMPT_TRACE_PATH}; attach it to a bug report.`
+		: `Set "debug": true in ${globalConfigPath()} and run the turn again to capture both prompts to ${PROMPT_TRACE_PATH}.`;
 });
 
 /** Whatever a settled session left behind, named in one greppable line.
@@ -1023,6 +1050,30 @@ function contextTools(context: Context): Tool[] | undefined {
 		if (declared.length > 0) return declared;
 	}
 	return context.tools;
+}
+
+/** The section breakdown behind the current system prompt, for the trace below. */
+function promptShape(messages: Context["messages"]): unknown {
+	const get = (piAi as { getCurrentSystemMessage?: (m: Context["messages"]) => { content?: unknown; sections?: Record<string, string> } | undefined }).getCurrentSystemMessage;
+	const msg = get ? get(messages) : undefined;
+	if (!msg) return null;
+	const sections = Object.entries(msg.sections ?? {}).map(([name, value]) => ({ name, length: value === null ? null : String(value).length }));
+	const systemMessages = messages.filter((m) => m.role === "system").length;
+	return { systemMessages, contentLength: typeof msg.content === "string" ? msg.content.length : JSON.stringify(msg.content ?? "").length, sections };
+}
+
+/** Append one JSON record per prompt we record or serve, beside the debug log.
+ *
+ *  Separate from `debug()` because these records carry whole system prompts: tens of
+ *  kilobytes each, which would bury every other line in the log. A prefix mismatch is
+ *  only diagnosable from the bytes, and the mismatch we chased appeared on a resumed
+ *  session nobody could reproduce on demand, so the trace has to be something a user
+ *  can switch on and hand over after the fact. */
+function dumpPromptEvent(event: string, data: () => Record<string, unknown>): void {
+	if (!DEBUG) return;
+	try {
+		appendFileSync(PROMPT_TRACE_PATH, JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, event, ...data() }) + "\n");
+	} catch {}
 }
 
 /**
@@ -1783,7 +1834,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = promptCaptures.resolveOrDerive(contextSystemPrompt(context));
+	const tracedPrompt = contextSystemPrompt(context);
+	dumpPromptEvent("turn", () => ({ incomingLength: tracedPrompt?.length ?? null, shape: promptShape(context.messages) }));
+	const promptCapture = promptCaptures.resolveOrDerive(tracedPrompt);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2241,6 +2294,7 @@ export default function (pi: ExtensionAPI) {
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
+	setDebugEnabled(config.debug);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
@@ -2286,6 +2340,7 @@ export default function (pi: ExtensionAPI) {
 		// Equal lengths mean we are keying on the prompt we were handed: either nothing
 		// wrapped it, or pi's own prompt could not be reproduced to key on instead.
 		const key = await basePromptKey(event.systemPrompt, options);
+		dumpPromptEvent("record", () => ({ keyLength: key.length, promptLength: event.systemPrompt.length, key, prompt: event.systemPrompt }));
 		debug(`prompt-capture: recorded ${key.length}-char key from the ${event.systemPrompt.length}-char prompt handed to us`);
 		promptCaptures.record(key, {
 			custom: options?.customPrompt,
