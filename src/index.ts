@@ -778,6 +778,19 @@ function syncSharedSession(
 		...(modelId ? { model: modelId } : {}),
 	});
 	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
+	// Priors that convert to nothing leave an empty session, and cc-session-io
+	// writes no file for zero records — the resume below then fails with "No
+	// conversation found". A fresh session hits this: pi's history is
+	// [system, user], turnStart walks back over the user turn only, so priors
+	// is [system] — non-empty, past the guard above — and convertPiMessages
+	// emits nothing for a system message. Treat it as the clean start it is.
+	if (session.records.length === 0) {
+		// deleteSession already wiped the old file, so the cached id is dead.
+		if (preserveId) sharedSession = null;
+		debug(`Case 1: clean start, ${priorMessages.length} prior message(s) converted to 0 records`);
+		debug(`syncResult: path=clean-start empty-import`);
+		return { sessionId: null };
+	}
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
@@ -980,6 +993,32 @@ function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	return undefined;
 }
 
+/**
+ * The tools pi is offering for this turn.
+ *
+ * pi 0.86.0 moved tool declarations out of `Context.tools` and into the
+ * transcript: `normalizeContext()` folds the system prompt and the tool set
+ * into a leading system message before any provider sees the context, so
+ * `context.tools` arrives undefined and the branded `TranscriptContext` that
+ * reaches us carries nothing but `messages`. Reading the old field served
+ * Claude Code no tools at all, which does not fail — the model announces the
+ * work it is about to do and ends the turn having called nothing, or prints a
+ * `<function_calls>` block as plain text.
+ *
+ * `getCurrentTools` replays the transcript's system messages back into the
+ * current tool set. It is looked up at call time rather than imported because
+ * pi below 0.86 does not export it, and `peerDependencies` still admits those
+ * versions — there the field is still populated and the fallback is correct.
+ */
+function contextTools(context: Context): Tool[] | undefined {
+	const getCurrentTools = (piAi as { getCurrentTools?: (messages: Context["messages"]) => Tool[] }).getCurrentTools;
+	if (getCurrentTools) {
+		const declared = getCurrentTools(context.messages);
+		if (declared.length > 0) return declared;
+	}
+	return context.tools;
+}
+
 function resolveMcpTools(context: Context, excludeToolName?: string): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
@@ -989,9 +1028,10 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	const customToolNameToSdk = new Map<string, string>();
 	const customToolNameToPi = new Map<string, string>();
 
-	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
+	const tools = contextTools(context);
+	if (!tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
 
-	for (const tool of context.tools) {
+	for (const tool of tools) {
 		if (tool.name === excludeToolName) continue;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
 		mcpTools.push(tool);

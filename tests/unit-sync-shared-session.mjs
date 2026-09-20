@@ -57,6 +57,35 @@ describe("syncSharedSession", () => {
 		}
 	});
 
+	// A brand-new session's history is [system, user]: turnStart walks back over
+	// the trailing user turn only, so priorMessages is [system] — non-empty, so
+	// the clean-start guard above misses — and convertPiMessages emits nothing
+	// for a system message. cc-session-io writes no file for zero records, so
+	// returning that session id made pi resume a file that does not exist:
+	// "No conversation found with session ID: ...", on every new session.
+	it("starts clean when the priors convert to no records", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const notices = [];
+		try {
+			__test.setPiUI({ notify: (message) => notices.push(message) });
+
+			const result = __test.syncSharedSession([
+				{ role: "system", content: "You are an expert coding assistant.", timestamp: Date.now() },
+				{ role: "user", content: "hi", timestamp: Date.now() },
+			], cwd);
+
+			assert.equal(
+				result.sessionId,
+				null,
+				"priors that import to zero records leave no session file on disk, so resuming that id always fails",
+			);
+			assert.deepEqual(__test.getSharedSession(), null);
+			assert.deepEqual(notices, [], "and no session-integrity warning should be shown for it");
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	// The rebuilt file holds one line per record, and a carried `@file` expansion
 	// is an `attachment` record — which `session.messages` filters out. Counting
 	// messages told every user who at-mentioned a file before switching providers

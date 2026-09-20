@@ -18,9 +18,17 @@ import assert from "node:assert/strict";
 
 const { default: activate, __test } = await import("../src/index.js");
 
+// The mock stubs every pi entry point activate() touches, not just the ones it
+// happens to reach on a default config: AskClaude registers when `askClaude.enabled`
+// is set, which activate() reads from the *developer's* real ~/.pi/agent config, so
+// omitting registerTool made these tests pass or fail on whoever ran them.
 function activateWithMockPi() {
 	const handlers = new Map();
-	activate({ on: (event, handler) => handlers.set(event, handler), registerProvider: () => {} });
+	activate({
+		on: (event, handler) => handlers.set(event, handler),
+		registerProvider: () => {},
+		registerTool: () => {},
+	});
 	return handlers;
 }
 
