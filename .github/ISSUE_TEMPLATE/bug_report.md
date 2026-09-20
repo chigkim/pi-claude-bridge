@@ -18,8 +18,8 @@ ideal. -->
 
 Run the failing scenario again with `CLAUDE_BRIDGE_DEBUG=1` set. This writes:
 
-- `~/.pi/agent/claude-bridge.log` — the main bridge log.
-- `~/.pi/agent/cc-cli-logs/<timestamp>-<tag>-<seq>.log` — one file per
+- `~/.pi/agent/logs/claude-bridge.log` — the main bridge log.
+- `~/.pi/agent/logs/cc-cli-logs/<timestamp>-<tag>-<seq>.log` — one file per
   Claude Code CLI invocation, matched by timestamp to the bridge log.
 
 Attach or paste the last ~50 lines of the bridge log around the failure, plus

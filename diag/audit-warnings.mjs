@@ -42,7 +42,7 @@ if (Number.isNaN(since)) {
 // the check red forever. Everything is still printed — only the exit narrows.
 const inWindow = (iso) => since === null || Date.parse(iso) >= since;
 const logPath = args.filter((a, i) => !a.startsWith("--") && i !== sinceArg + 1)[0]
-	?? join(homedir(), ".pi/agent/claude-bridge.log");
+	?? join(homedir(), ".pi/agent/logs/claude-bridge.log");
 
 function run() {
 	let text;

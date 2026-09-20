@@ -11,6 +11,11 @@ import { dirname, join } from "path";
 export interface Config {
 	/** Date (YYYY-MM-DD) the one-time startup notice was shown. Written by the extension, not the user. */
 	startupNoticeShown?: string;
+	/** Write a debug log to ~/.pi/agent/logs/, plus a system-prompt trace beside it.
+	 *  `CLAUDE_BRIDGE_DEBUG=1` does the same; either one turns it on. Config exists because the
+	 *  env var has to be set before pi starts, which is no help to a user already inside a session
+	 *  that just failed. */
+	debug?: boolean;
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;
@@ -86,6 +91,7 @@ export function loadConfig(cwd: string): Config {
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
 	return {
 		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,
+		debug: project.debug ?? global.debug,
 		askClaude: { ...global.askClaude, ...project.askClaude },
 		provider: { ...global.provider, ...project.provider },
 	};

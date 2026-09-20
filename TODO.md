@@ -138,7 +138,7 @@ Nothing to fix here -- filed or inherent in the other project.
   shared session, so the fix is deletion, not suppression.)
 
 - **CC CLI debug log accumulation**: When `CLAUDE_BRIDGE_DEBUG=1`, every
-  `query()` call writes a new file under `~/.pi/agent/cc-cli-logs/`. These
+  `query()` call writes a new file under `~/.pi/agent/logs/cc-cli-logs/`. These
   accumulate indefinitely.
 
 - **Bun/Node hash mismatch for >200-char paths** (cc-session-io known
