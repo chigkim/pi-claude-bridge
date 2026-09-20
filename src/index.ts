@@ -456,7 +456,13 @@ function newAssistantOutput(model: Model<any>, text: string, stopReason: Assista
 	};
 }
 
-function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
+function extractIsolatedSummaryPrompt(all: Context["messages"]): string {
+	// pi 0.86.0 normalizes before handing a context to any streamFn, so the single
+	// user message pi builds for a summarization now arrives behind the system message
+	// that carries the prompt. Counting it made every takeover throw on arrival, which
+	// the handler turns into a cancelled compaction. Pre-0.86 sends the user message
+	// alone, where the filter is a no-op.
+	const messages = all.filter((m) => m.role !== "system");
 	if (messages.length !== 1 || messages[0].role !== "user") {
 		throw new Error(
 			`isolatedStreamFn: expected exactly 1 user message, got ${messages.length} ` +
@@ -536,7 +542,7 @@ async function runIsolatedSummary(
 				settingSources: [] as SettingSource[],
 				skills: [],
 				persistSession: false,
-				systemPrompt: context.systemPrompt,
+				systemPrompt: contextSystemPrompt(context),
 				model: cliModel,
 				maxTurns: 1,
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
@@ -1017,6 +1023,33 @@ function contextTools(context: Context): Tool[] | undefined {
 		if (declared.length > 0) return declared;
 	}
 	return context.tools;
+}
+
+/**
+ * The system prompt pi assembled for this turn.
+ *
+ * The other half of the 0.86.0 transcript move described above: the prompt is
+ * now carried by the transcript's system messages, so `context.systemPrompt`
+ * arrives undefined. Reading it meant `resolveOrDerive` was handed nothing,
+ * returned undefined rather than throwing, and Claude Code ran with none of the
+ * user's context files, skills, or `--system-prompt` text — the exact silent
+ * loss that resolver's throw exists to prevent, reached by the one path it
+ * cannot see. A probe with an AGENTS.md codeword confirmed the model never
+ * received it.
+ *
+ * `getCurrentSystemPrompt` replays every system message into the current prompt
+ * text. For the ordinary single leading system message that is the assembled
+ * prompt byte-for-byte, so it matches the recorded capture key exactly; later
+ * sections and appends go through the resolver's embed path. Looked up at call
+ * time for the same reason as `getCurrentTools`.
+ */
+function contextSystemPrompt(context: Context): string | undefined {
+	const getCurrentSystemPrompt = (piAi as { getCurrentSystemPrompt?: (messages: Context["messages"]) => string }).getCurrentSystemPrompt;
+	if (getCurrentSystemPrompt) {
+		const prompt = getCurrentSystemPrompt(context.messages);
+		if (prompt.length > 0) return prompt;
+	}
+	return context.systemPrompt;
 }
 
 function resolveMcpTools(context: Context, excludeToolName?: string): {
@@ -1626,10 +1659,42 @@ function discardRewrittenQuery(c: QueryContext): void {
 	debug("provider: history rewritten under a parked query — discarded it, rotating session, rebuilding from current history");
 }
 
+/** A pi-internal one-shot summarization arriving on the ordinary provider path.
+ *
+ *  Compaction and branch summarization are taken over at `session_before_compact`
+ *  and `session_before_tree`. `/bug` has no such event: agent-session's
+ *  `summarizeForBugReport` hands `this.agent.streamFunction` straight to
+ *  `completeSummarization` (core/bug-report.js), so on a bridge model it lands here
+ *  carrying pi's BUG_SUMMARY_SYSTEM_PROMPT — a prompt no `before_agent_start`
+ *  recorded, which the resolver refuses by design. Refusing is right for a user
+ *  turn, where a missing capture means the user's context files and skills would be
+ *  dropped silently. It is wrong here: there is no user context to lose, and the
+ *  only effect is that the command for reporting a bridge bug cannot run on the
+ *  bridge.
+ *
+ *  Recognised by shape rather than by prompt text, so a reworded or renamed pi
+ *  prompt does not quietly regress, and so the next internal consumer is handled
+ *  before we learn it exists: one user message, no tools offered, and a system
+ *  prompt we never recorded. A real turn fails at least one of those — pi always
+ *  declares its tool set, and its own prompt is always recorded.
+ */
+function isIsolatedSummarization(context: Context): boolean {
+	const messages = context.messages.filter((m) => m.role !== "system");
+	if (messages.length !== 1 || messages[0].role !== "user") return false;
+	if ((contextTools(context) ?? []).length > 0) return false;
+	const systemPrompt = contextSystemPrompt(context);
+	return Boolean(systemPrompt) && !promptCaptures.resolve(systemPrompt);
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
+
+	if (ctx().activeQuery === null && isIsolatedSummarization(context)) {
+		debug("provider: pi-internal summarization with no recorded prompt — routing to the isolated path");
+		return isolatedStreamFn(model, context, options);
+	}
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -1718,7 +1783,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+	const promptCapture = promptCaptures.resolveOrDerive(contextSystemPrompt(context));
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",

@@ -37,7 +37,8 @@ const PI_DIST = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding
  *  branch-summarization miss, and a filename-only inventory would wave it through.
  *  A changed count is not automatically a bug; it means read the diff and re-decide. */
 const HANDLED = {
-	"agent-session.js": { mentions: 1, why: "the one hand-off: `streamFn: this.agent.streamFunction` into generateBranchSummary" },
+	"agent-session.js": { mentions: 2, why: "two hand-offs of `this.agent.streamFunction`: generateBranchSummary and generateBugReportSummary" },
+	"bug-report.js": { mentions: 1, why: "reaches the provider — /bug has no session_before_* event to take over, so the provider recognises it by shape and routes it to isolatedStreamFn" },
 	"sdk.js": { mentions: 2, why: "constructs the agent, does not summarize" },
 	"compaction/compaction.js": { mentions: 13, why: "taken over via session_before_compact -> isolatedStreamFn" },
 	"compaction/branch-summarization.js": { mentions: 2, why: "taken over via session_before_tree -> isolatedStreamFn" },
