@@ -55,8 +55,11 @@ export class PromptCaptures {
 	 *  the resolver is hot and the caller may own a faster sink than string-building.
 	 *
 	 *  Set by the bridge on the shared instance; tests that want the diagnostic can
-	 *  pass one per instance. */
-	private readonly onDiagnose: (diagnostic: PromptCaptureDiagnostic) => void;
+	 *  pass one per instance.
+	 *
+	 *  May return a line telling the user how to capture the prompts behind a miss; it is
+	 *  appended to the thrown error, which is all most users will ever see. */
+	private readonly onDiagnose: (diagnostic: PromptCaptureDiagnostic) => string | void;
 
 	/** Pi rebuilds prompts when tools change, so retain only recent lookup keys.
 	 *  Inheritance edges hold direct references and survive key eviction.
@@ -67,7 +70,7 @@ export class PromptCaptures {
 	 *  own next turn would be evicted despite being in use. The bound exists only to
 	 *  cap an extension that rebuilds the prompt every turn, which would otherwise
 	 *  grow keys without limit. */
-	constructor(private readonly limit = 256, onDiagnose?: (diagnostic: PromptCaptureDiagnostic) => void) {
+	constructor(private readonly limit = 256, onDiagnose?: (diagnostic: PromptCaptureDiagnostic) => string | void) {
 		this.onDiagnose = onDiagnose ?? (() => {});
 	}
 
@@ -166,7 +169,7 @@ export class PromptCaptures {
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
 		if (embedded.length === 0) {
 			const matches = this.closestKnown(systemPrompt);
-			this.onDiagnose({ systemPrompt, matches });
+			const hint = this.onDiagnose({ systemPrompt, matches });
 			throw new Error(
 				`prompt-capture: no capture for this ${systemPrompt.length}-char system prompt, and it embeds none of the ${this.captures.size} known. `
 				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} `
@@ -174,7 +177,8 @@ export class PromptCaptures {
 				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
 				+ `The usual cause is an extension loaded after claude-bridge that rewrites the system prompt from before_agent_start — `
 				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match. `
-				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery.)`,
+				+ `(Also possible: pi rebuilt the prompt outside before_agent_start — a late-registered tool or fresh resource discovery.)`
+				+ (hint ? ` ${hint}` : ``),
 			);
 		}
 

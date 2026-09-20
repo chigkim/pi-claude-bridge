@@ -18,7 +18,7 @@ node --import tsx diag/audit-warnings.mjs    [claude-bridge.log] [--since YYYY-M
 node --import tsx diag/replay-write-path.mjs <pi-session.jsonl>
 ```
 
-Defaults are `~/.claude/projects` and `~/.pi/agent/claude-bridge.log`.
+Defaults are `~/.claude/projects` and `~/.pi/agent/logs/claude-bridge.log`.
 
 **`--since` is what makes these gates rather than reports.** Everything found is
 always printed, but the exit code counts only records and log lines inside the
@@ -311,7 +311,7 @@ detector is wired into the ordinary API path (`services/api/claude.ts:1471`
 is emitted by a plain `logForDebugging(summary, { level: 'warn' })` gated only on
 `isDebugMode()` — which the bridge already sets for every query via
 `makeCliDebugOptions` (`src/index.ts:71`). It would land straight in
-`~/.pi/agent/cc-cli-logs/*.log` as:
+`~/.pi/agent/logs/cc-cli-logs/*.log` as:
 
 ```
 [PROMPT CACHE BREAK] <reason> [source=…, call #N, cache read: X → Y, creation: Z…]
@@ -554,7 +554,7 @@ tool results queued for a handler that never claimed them: 14  (7 after abort/sh
 - **`BUG: both maps non-empty!`** (1, 2026-07-29T15:33:17.805Z, module `ere6hm`)
   is the phantom-tool bug caught live: the queued id
   `toolu_01JzMLYBmz7yEx9R9Zc4AvdB` appears in
-  `~/.pi/agent/cc-cli-logs/2026-07-29T15-27-41-863Z-provider-3.log` as
+  `~/.pi/agent/logs/cc-cli-logs/2026-07-29T15-27-41-863Z-provider-3.log` as
   `Unknown tool bash`. The turn hung 27 minutes until the user aborted. Fixed in
   122914dd.
 - **28 of 32 stranded handlers** are followed by `wasAborted=true`,

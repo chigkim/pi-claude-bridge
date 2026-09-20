@@ -109,10 +109,14 @@ Integration tests spawn real `pi` and Claude Code subprocesses, so they need wri
 
 ## Debugging
 
-Set `CLAUDE_BRIDGE_DEBUG=1` to enable debug output:
+Set `CLAUDE_BRIDGE_DEBUG=1`, or `"debug": true` in `~/.pi/agent/claude-bridge.json`, to enable debug output. The config setting is there for when a session has already failed and restarting pi with an env var would lose the state you want captured.
 
-- **Bridge log** at `~/.pi/agent/claude-bridge.log` — every provider call, session sync decision, tool result delivery, and CC's stderr. Override location with `CLAUDE_BRIDGE_DEBUG_PATH`.
-- **Per-query Claude Code CLI logs** at `~/.pi/agent/cc-cli-logs/<timestamp>-<tag>-<seq>.log` — the CC subprocess's own debug stream, one file per `query()` call. Tags are `provider` (main turn) or `askclaude` (sub-delegation). Useful when a resume fails or CC misbehaves internally — shows the CLI's own view of session loading, API requests, and tool calls.
+Everything lands under `~/.pi/agent/logs/`:
+
+- **Bridge log** at `~/.pi/agent/logs/claude-bridge.log` — every provider call, session sync decision, tool result delivery, and CC's stderr. Override location with `CLAUDE_BRIDGE_DEBUG_PATH`.
+- **Per-query Claude Code CLI logs** at `~/.pi/agent/logs/cc-cli-logs/<timestamp>-<tag>-<seq>.log` — the CC subprocess's own debug stream, one file per `query()` call. Tags are `provider` (main turn) or `askclaude` (sub-delegation). Useful when a resume fails or CC misbehaves internally — shows the CLI's own view of session loading, API requests, and tool calls.
+
+- **System prompt trace** at `~/.pi/agent/logs/claude-bridge-prompts.jsonl` — one JSON record per system prompt the bridge records at agent start (`record`) or is handed on a turn (`turn`), plus the full text of both sides of any `prompt-capture: no capture for this ...` failure (`miss`). The prompts are large, which is why they are not in the main log.
 
 When filing a bug about a session-resume failure (e.g. "No conversation found"), the most useful attachments are the `syncResult:` lines from the bridge log plus the matching `cc-cli-logs/` file for the failing query.
 
