@@ -7,15 +7,22 @@ import { readFileSync } from "node:fs";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown } from "../src/config.js";
 
+// Redirect the global config away from the developer's own agent dir.
+//
+// This used to set HOME, which does nothing on Windows: getAgentDir() resolves
+// PI_CODING_AGENT_DIR and then a platform-specific default, never HOME, so
+// every test below wrote its fixtures into the real ~/.pi/agent/claude-bridge.json
+// and destroyed the settings of whoever ran the suite. Running `npm run test:unit`
+// once was enough to leave the malformed-config fixture sitting in a live install.
 function withTempHome(fn) {
-	const oldHome = process.env.HOME;
+	const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const home = mkdtempSync(join(tmpdir(), "claude-bridge-home-"));
 	try {
-		process.env.HOME = home;
+		process.env.PI_CODING_AGENT_DIR = join(home, "agent");
 		return fn(home);
 	} finally {
-		if (oldHome === undefined) delete process.env.HOME;
-		else process.env.HOME = oldHome;
+		if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 		rmSync(home, { recursive: true, force: true });
 	}
 }

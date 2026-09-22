@@ -99,6 +99,18 @@ run "tool: AskClaude responds" \
     -p 'Use the AskClaude tool with prompt=\"What is 2+2? Reply with just the number.\" and then tell me the answer.' 2>&1 \
     | grep -q '\"toolName\":\"AskClaude\"' && echo ok"
 
+# The bridge serves pi's tools over its own MCP server, so a tool call is the one
+# thing no other test here covers: every check above passes on a run where Claude
+# is handed no tools at all. It does not fail loudly either — the model narrates
+# the call and ends the turn — so this asserts the tool result reached the model,
+# via a token it cannot produce without reading the file. pi 0.86.0 moving tool
+# declarations from `Context.tools` into the transcript broke exactly this.
+run "tool: Claude calls a pi tool through the bridge" \
+  bash -c "cd '$TEST_CWD' && echo 'The secret token is PLUMBAGO-77.' > smoke-token.txt && \
+    pi --no-session -ne -e '$DIR' --model 'claude-bridge/claude-haiku-4-5' \
+    -p 'Read smoke-token.txt in the current directory and reply with only the token.' 2>&1 \
+    | grep -q 'PLUMBAGO-77' && echo ok"
+
 # --- Summary ---
 
 echo ""
