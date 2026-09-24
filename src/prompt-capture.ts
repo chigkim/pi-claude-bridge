@@ -408,7 +408,7 @@ function assertSendablePrompt(parts: readonly PromptPart[], capture: PromptCaptu
 		`  Capture: ${capture.source ?? "unknown"}, ${capture.inherited.length} inherited capture(s) substituted.`,
 		"  If this came from an inherited pi prompt, see README \"Compatibility with other extensions\".",
 		"  If it is your own text, reword or remove it. CLAUDE_BRIDGE_DEBUG=1 writes the full prompt to",
-		"  ~/.pi/agent/claude-bridge.log.",
+		"  ~/.pi/agent/logs/claude-bridge.log.",
 	].join("\n"));
 }
 
