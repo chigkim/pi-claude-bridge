@@ -1,6 +1,6 @@
 import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, CONFIG_DIR_NAME, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -942,13 +942,32 @@ let queryImpl: typeof query = query;
  *  compaction extensions rather than by pi) names, when it is one the registry
  *  knows and not a bridge model, whose compaction is the takeover's own. Read at
  *  each compaction, so an edit applies without a reload. */
-function compactionModel(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, settingsPath = join(getAgentDir(), "settings.json")): Model<any> | undefined {
-	let named: unknown;
-	try {
-		named = JSON.parse(readFileSync(settingsPath, "utf-8"))?.compaction?.model;
-	} catch {
-		return undefined;
-	}
+// pi's summary drops "off" itself (`createSummarizationOptions`), so it passes through.
+type CompactionThinking = Parameters<typeof compact>[6];
+const COMPACTION_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** The `compaction` table of settings.json: the project's `.pi/settings.json` first,
+ *  then the agent dir's, key by key as pi merges its own settings. A file that is
+ *  missing or unreadable contributes nothing. */
+function compactionSettings(cwd: string): Record<string, unknown> {
+	const read = (path: string): Record<string, unknown> => {
+		try {
+			const table = JSON.parse(readFileSync(path, "utf-8"))?.compaction;
+			return table && typeof table === "object" && !Array.isArray(table) ? table : {};
+		} catch {
+			return {};
+		}
+	};
+	return { ...read(join(getAgentDir(), "settings.json")), ...read(join(cwd, CONFIG_DIR_NAME, "settings.json")) };
+}
+
+/** The model `compaction.model` names and the level `compaction.thinkingLevel` asks
+ *  for, or nothing when no usable non-bridge model is named. A level the model cannot
+ *  reason at is pi's to drop (`createSummarizationOptions`); a level that is not one
+ *  warns and runs at none. */
+function compactionModel(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "cwd">): { model: Model<any>; thinkingLevel: CompactionThinking | undefined } | undefined {
+	const settings = compactionSettings(ctx.cwd);
+	const named = settings.model;
 	if (typeof named !== "string" || !named.trim()) return undefined;
 	const slash = named.indexOf("/");
 	const model = slash > 0 ? ctx.modelRegistry.find(named.slice(0, slash), named.slice(slash + 1).trim()) : undefined;
@@ -956,7 +975,13 @@ function compactionModel(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, se
 		ctx.ui?.notify?.(`Compaction model ${named} is unavailable; compacting with Claude instead.`, "warning");
 		return undefined;
 	}
-	return model.baseUrl === "claude-bridge" ? undefined : model;
+	if (model.baseUrl === "claude-bridge") return undefined;
+	const level = settings.thinkingLevel;
+	if (level !== undefined && !COMPACTION_THINKING.includes(level as string)) {
+		ctx.ui?.notify?.(`Invalid compaction.thinkingLevel: ${String(level)}. Expected one of ${COMPACTION_THINKING.join(", ")}.`, "warning");
+		return { model, thinkingLevel: undefined };
+	}
+	return { model, thinkingLevel: level as CompactionThinking | undefined };
 }
 
 export const __test = {
@@ -2614,8 +2639,9 @@ export default function (pi: ExtensionAPI) {
 		// the provider's auth applies and the usage lands on the compaction entry.
 		// Only a failure falls through to the Claude takeover below, which keeps the
 		// hang guard: pi's native compact is never reached on a bridge model.
-		const configured = compactionModel(ctx);
-		if (configured) {
+		const chosen = compactionModel(ctx);
+		if (chosen) {
+			const configured = chosen.model;
 			try {
 				const compaction = await compact(
 					event.preparation,
@@ -2624,10 +2650,13 @@ export default function (pi: ExtensionAPI) {
 					undefined,
 					event.customInstructions,
 					event.signal,
-					undefined,
+					chosen.thinkingLevel,
 					(model, context, options) => ctx.modelRegistry.streamSimple(model, context, options),
 				);
-				debug(`session_before_compact: ${configured.provider}/${configured.id} complete summaryLen=${compaction.summary.length}`);
+				debug(
+					`session_before_compact: ${configured.provider}/${configured.id} thinking=${chosen.thinkingLevel ?? "none"} ` +
+					`complete summaryLen=${compaction.summary.length}`,
+				);
 				return { compaction };
 			} catch (err) {
 				if (event.signal?.aborted) return { cancel: true };

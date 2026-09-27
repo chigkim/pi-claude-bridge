@@ -12,9 +12,9 @@
  * path to what the setting cannot name.
  */
 
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,13 @@ const agentDir = mkdtempSync(join(tmpdir(), "claude-bridge-test-agent-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 process.on("exit", () => rmSync(agentDir, { recursive: true, force: true }));
 const settings = (value) => writeFileSync(join(agentDir, "settings.json"), JSON.stringify(value));
+// A project's .pi/settings.json, read from the session's cwd before the agent dir's.
+const projectDir = mkdtempSync(join(tmpdir(), "claude-bridge-test-project-"));
+mkdirSync(join(projectDir, ".pi"));
+process.on("exit", () => rmSync(projectDir, { recursive: true, force: true }));
+const projectSettings = (value) => value === undefined
+	? rmSync(join(projectDir, ".pi", "settings.json"), { force: true })
+	: writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify(value));
 
 const { default: activate, __test } = await import("../src/index.js");
 
@@ -35,6 +42,7 @@ function context({ models = [luna, opus], stream } = {}) {
 	return {
 		notes,
 		model: opus,
+		cwd: projectDir,
 		ui: { notify: (text, level) => notes.push([level, text]) },
 		modelRegistry: {
 			find: (provider, id) => models.find((m) => m.provider === provider && m.id === id),
@@ -71,6 +79,8 @@ function handler() {
 }
 
 describe("compactionModel", () => {
+	beforeEach(() => projectSettings(undefined));
+
 	it("is nothing when settings name no compaction model", () => {
 		settings({ defaultModel: "claude-opus-5" });
 		assert.equal(__test.compactionModel(context()), undefined);
@@ -78,7 +88,20 @@ describe("compactionModel", () => {
 
 	it("resolves the provider/modelId settings name", () => {
 		settings({ compaction: { model: "openai-codex/gpt-6-luna" } });
-		assert.equal(__test.compactionModel(context()), luna);
+		assert.deepEqual(__test.compactionModel(context()), { model: luna, thinkingLevel: undefined });
+	});
+
+	it("reads the project's .pi/settings.json first, key by key", () => {
+		settings({ compaction: { model: "openai-codex/gpt-9", thinkingLevel: "high" } });
+		projectSettings({ compaction: { model: "openai-codex/gpt-6-luna" } });
+		assert.deepEqual(__test.compactionModel(context()), { model: luna, thinkingLevel: "high" });
+	});
+
+	it("warns on a thinking level that is not one, and runs at none", () => {
+		settings({ compaction: { model: "openai-codex/gpt-6-luna", thinkingLevel: "hard" } });
+		const ctx = context();
+		assert.deepEqual(__test.compactionModel(ctx), { model: luna, thinkingLevel: undefined });
+		assert.match(ctx.notes[0][1], /Invalid compaction.thinkingLevel: hard/);
 	});
 
 	it("warns and yields nothing for a model the registry does not know", () => {
@@ -101,6 +124,21 @@ describe("compaction on a bridge session", () => {
 		assert.match(result.compaction.summary, /^summary by gpt-6-luna/);
 		assert.deepEqual(result.compaction.usage, usage, "the call is recorded, unlike the takeover's");
 		assert.equal(result.compaction.firstKeptEntryId, "kept");
+	});
+
+	it("asks the configured model for compaction.thinkingLevel", async () => {
+		settings({ compaction: { model: "openai-codex/gpt-6-luna", thinkingLevel: "medium" } });
+		const asked = [];
+		const reasoner = { ...luna, reasoning: true };
+		const ctx = context({
+			models: [reasoner, opus],
+			stream: (model, _context, options) => {
+				asked.push(options.reasoning);
+				return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "summary" }], stopReason: "stop", usage }) };
+			},
+		});
+		await handler()(compactEvent(), ctx);
+		assert.deepEqual(asked, ["medium"]);
 	});
 
 	it("cancels on abort rather than starting a second summary", async () => {
