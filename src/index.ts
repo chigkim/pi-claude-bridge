@@ -1,11 +1,11 @@
 import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -938,7 +938,29 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 let queryImpl: typeof query = query;
 
 // @internal
+/** The model settings.json's `compaction.model` ("provider/modelId", read by
+ *  compaction extensions rather than by pi) names, when it is one the registry
+ *  knows and not a bridge model, whose compaction is the takeover's own. Read at
+ *  each compaction, so an edit applies without a reload. */
+function compactionModel(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, settingsPath = join(getAgentDir(), "settings.json")): Model<any> | undefined {
+	let named: unknown;
+	try {
+		named = JSON.parse(readFileSync(settingsPath, "utf-8"))?.compaction?.model;
+	} catch {
+		return undefined;
+	}
+	if (typeof named !== "string" || !named.trim()) return undefined;
+	const slash = named.indexOf("/");
+	const model = slash > 0 ? ctx.modelRegistry.find(named.slice(0, slash), named.slice(slash + 1).trim()) : undefined;
+	if (!model) {
+		ctx.ui?.notify?.(`Compaction model ${named} is unavailable; compacting with Claude instead.`, "warning");
+		return undefined;
+	}
+	return model.baseUrl === "claude-bridge" ? undefined : model;
+}
+
 export const __test = {
+	compactionModel,
 	setQuery(fn: typeof query | null) {
 		queryImpl = fn ?? query;
 	},
@@ -2582,6 +2604,42 @@ export default function (pi: ExtensionAPI) {
 		);
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
+		} catch (err) {
+			debug("session_before_compact: file-op carry-forward failed; cancelling", err);
+			return { cancel: true };
+		}
+
+		// A `compaction.model` in settings.json names the model compactions should
+		// run on. Honour it with pi's own summary, streamed through the registry so
+		// the provider's auth applies and the usage lands on the compaction entry.
+		// Only a failure falls through to the Claude takeover below, which keeps the
+		// hang guard: pi's native compact is never reached on a bridge model.
+		const configured = compactionModel(ctx);
+		if (configured) {
+			try {
+				const compaction = await compact(
+					event.preparation,
+					configured,
+					undefined,
+					undefined,
+					event.customInstructions,
+					event.signal,
+					undefined,
+					(model, context, options) => ctx.modelRegistry.streamSimple(model, context, options),
+				);
+				debug(`session_before_compact: ${configured.provider}/${configured.id} complete summaryLen=${compaction.summary.length}`);
+				return { compaction };
+			} catch (err) {
+				if (event.signal?.aborted) return { cancel: true };
+				debug(`session_before_compact: ${configured.provider}/${configured.id} failed; falling back to the takeover`, err);
+				ctx.ui?.notify?.(
+					`Compaction with ${configured.provider}/${configured.id} failed (${errorMessage(err)}); compacting with Claude instead.`,
+					"warning",
+				);
+			}
+		}
+
+		try {
 			const compaction = await compact(
 				event.preparation,
 				ctx.model,
