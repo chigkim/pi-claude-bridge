@@ -3,6 +3,7 @@
 ## UNRELEASED
 
 - **Bump: Claude Sonnet 5.5** — Should appear in `/model` with 1M context once pi-ai ships the new catalog entry. Agent SDK bumped to ^0.3.284 (Claude Code 2.1.284).
+- **Tests: integration suite could not run on Windows** — the RPC harness split `PATH` on `:`, which shreds every Windows path at its drive letter, and spawned `pi` rather than npm's `.cmd` shim; it now splits on the platform delimiter and spawns `node` on pi's resolved entry point.
 
 ## 0.9.0 — 2026-09-27
 
