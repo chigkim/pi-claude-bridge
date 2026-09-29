@@ -1,6 +1,6 @@
 import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, CONFIG_DIR_NAME, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, CONFIG_DIR_NAME, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -24,6 +24,7 @@ import {
 import { basePromptKey } from "./base-prompt.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
+import { carryForwardFileOps, MAX_CARRIED_FILE_OPS } from "./compaction-file-ops.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
@@ -700,40 +701,6 @@ async function runIsolatedSummary(
 	}
 }
 
-/** Cap on how many prior-compaction file paths we carry into the next summary.
- *  Each compaction records the files it was handed *plus* everything the previous one
- *  knew, so re-injecting the whole list unions a union: it can only grow. One observed
- *  session climbed 62 -> 99 modified paths over 15 compactions and was still going.
- *  The newest paths are the ones a summary can still act on, so we trim the oldest. */
-const MAX_REINJECTED_FILE_OPS = 64;
-
-/** Add prior paths newest-first until `target` reaches the cap; returns how many landed.
- *  Paths from the current turn are already in `target` and are never evicted. */
-function addNewestFileOps(target: Set<string>, prior: unknown[]): number {
-	let added = 0;
-	for (let i = prior.length - 1; i >= 0 && target.size < MAX_REINJECTED_FILE_OPS; i--) {
-		const file = String(prior[i]);
-		if (target.has(file)) continue;
-		target.add(file);
-		added++;
-	}
-	return added;
-}
-
-function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
-	const prior = [...branchEntries]
-		.reverse()
-		.find((entry): entry is CompactionEntry => entry.type === "compaction");
-	const details = prior?.details as { readFiles?: unknown; modifiedFiles?: unknown } | undefined;
-	if (!Array.isArray(details?.readFiles) || !Array.isArray(details?.modifiedFiles)) return;
-	const read = addNewestFileOps(preparation.fileOps.read, details.readFiles);
-	const edited = addNewestFileOps(preparation.fileOps.edited, details.modifiedFiles);
-	debug(
-		`compact takeover: re-injected prior file ops read=${read}/${details.readFiles.length} ` +
-		`modified=${edited}/${details.modifiedFiles.length} (cap ${MAX_REINJECTED_FILE_OPS})`,
-	);
-}
-
 interface SyncResult {
 	sessionId: string | null;
 	preserveSharedSession?: boolean;
@@ -1028,8 +995,6 @@ export const __test = {
 	get promptCaptures() {
 		return promptCaptures;
 	},
-	reinjectPriorCompactionFileOps,
-	MAX_REINJECTED_FILE_OPS,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -2628,7 +2593,11 @@ export default function (pi: ExtensionAPI) {
 			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
 		);
 		try {
-			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
+			const carried = carryForwardFileOps(event.branchEntries, event.preparation, ctx.cwd);
+			debug(
+				`compact takeover: carried forward earlier file ops read=${carried.read} modified=${carried.modified} ` +
+				`of ${carried.candidates} files (${carried.missing} no longer exist; cap ${MAX_CARRIED_FILE_OPS})`,
+			);
 		} catch (err) {
 			debug("session_before_compact: file-op carry-forward failed; cancelling", err);
 			return { cancel: true };
