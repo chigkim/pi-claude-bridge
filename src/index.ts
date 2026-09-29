@@ -11,7 +11,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
-import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
+import { findParentChainBreak, verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
@@ -240,6 +240,33 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
  *  pre-existing single-slot semantics. */
 function sessionKey(piSessionId: string | null | undefined): string {
 	return piSessionId ?? "(none)";
+}
+
+/**
+ * Whether a session is safe to resume: Claude Code replays only the records its
+ * `parentUuid` chain reaches walking back from the leaf, so a break makes
+ * everything before it invisible to the model with nothing in the stream to say
+ * so. Unreadable files report intact — the rebuild path handles those, and a
+ * read error is not evidence of a break.
+ *
+ * Costs one full read + parse of the session file per fresh query. Measured at
+ * ~9ms on the largest real session on hand (913KB / 447 records) and ~42ms on a
+ * synthetic 10MB / 5000-record one; the walk itself is ~0.1ms, so this is read
+ * cost, not algorithm cost, and it is noise against the round trip it guards.
+ */
+function resumeChainIsIntact(sessionId: string, cwd: string): boolean {
+	let records;
+	try {
+		records = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR }).records;
+	} catch (error) {
+		debug(`WARNING: could not read session ${sessionId.slice(0, 8)} to check its parent chain:`, error);
+		return true;
+	}
+	const chainBreak = findParentChainBreak(records as unknown as Array<Record<string, any>>);
+	if (!chainBreak) return true;
+	debug(`WARNING resume chain: ${chainBreak} — session ${sessionId.slice(0, 8)}; rebuilding and rotating instead of resuming`);
+	diagDump("resume_chain_break", { sessionId: sessionId.slice(0, 8), cwd, detail: chainBreak });
+	return false;
 }
 
 /** Mirror of the CC conversation one pi session's turns are running on. One
@@ -762,7 +789,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// every read and write below addresses sessionStateFor(piSessionId), so a
 	// foreign session's shape-matching context can never REUSE or rebuild another
 	// session's CC file.
-	const sharedSession = sessionStateFor(piSessionId);
+	let sharedSession = sessionStateFor(piSessionId);
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
@@ -778,14 +805,23 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
 		if (missed.length === 0 || trailingAssistantOnly) {
-		if (trailingAssistantOnly) {
-			setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd });
-			debug(`Case 3: advanced cursor past trailing assistant, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${priorMessages.length}`);
-		} else {
-			debug(`Case 3: resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-		}
-		debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession?.cursor}`);
-		return { sessionId: sharedSession.sessionId };
+			// A file we wrote is connected by construction; a file an orphaned CC
+			// subprocess has since appended to may not be, and CC replays only what
+			// the parent chain reaches from the leaf. Resuming a broken one silently
+			// drops the records before the break. Rebuild instead — and rotate,
+			// because whatever appended may still be writing.
+			if (resumeChainIsIntact(sharedSession.sessionId, sharedSession.cwd ?? cwd)) {
+				if (trailingAssistantOnly) {
+					setSessionStateFor(piSessionId, { ...sharedSession, cursor: priorMessages.length, cwd });
+					debug(`Case 3: advanced cursor past trailing assistant, resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${priorMessages.length}`);
+				} else {
+					debug(`Case 3: resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+				}
+				debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession?.cursor}`);
+				return { sessionId: sharedSession.sessionId };
+			}
+			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			setSessionStateFor(piSessionId, sharedSession);
 		}
 	}
 	// This is what keeps a caller with a pruned or short context from resuming

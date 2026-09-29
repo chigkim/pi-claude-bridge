@@ -11,7 +11,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { repairToolPairing } from "cc-session-io";
-import { verifyWrittenSession } from "../src/session-verify.js";
+import { findParentChainBreak, verifyWrittenSession } from "../src/session-verify.js";
 
 // --- repairToolPairing ---
 
@@ -84,5 +84,75 @@ describe("verifyWrittenSession", () => {
 		const warnings = verifyWrittenSession(path, SID, 1);
 		assert.equal(warnings.length, 1);
 		assert.match(warnings[0], /malformed JSONL/);
+	});
+});
+
+// --- findParentChainBreak ---
+//
+// Claude Code resumes a session by walking parentUuid back from the leaf, not by
+// reading the file top to bottom. A record naming a parent no record defines
+// truncates the replay there, and everything earlier in the file is dropped with
+// nothing in the stream to say so. That is how a post-compaction rebuild handed
+// CC a file whose record [0] was the compaction summary and still left the model
+// reporting no context at all: an orphaned CC subprocess, interrupted by
+// discardRewrittenQuery, flushed its "[Request interrupted by user]" record into
+// the recreated file carrying a parent uuid from the deleted generation.
+
+describe("findParentChainBreak", () => {
+	const dir = mkdtempSync(join(tmpdir(), "chain-break-"));
+	const path = join(dir, "session.jsonl");
+	const SID = "chain-sid";
+	after(() => rmSync(dir, { recursive: true, force: true }));
+
+	const chain = (...links) =>
+		links.map(([uuid, parentUuid], i) => ({ type: i % 2 ? "user" : "assistant", uuid, parentUuid }));
+
+	it("returns null for a chain that reaches a root", () => {
+		assert.equal(findParentChainBreak(chain(["a", null], ["b", "a"], ["c", "b"])), null);
+	});
+
+	it("returns null when there are no conversation records", () => {
+		assert.equal(findParentChainBreak([{ type: "last-prompt" }, { type: "atis-latch" }]), null);
+	});
+
+	it("returns null for an empty file", () => {
+		assert.equal(findParentChainBreak([]), null);
+	});
+
+	it("ignores uuid-less bookkeeping records interleaved in the chain", () => {
+		const records = [
+			{ type: "assistant", uuid: "a", parentUuid: null },
+			{ type: "mode" },
+			{ type: "user", uuid: "b", parentUuid: "a" },
+			{ type: "atis-latch" },
+		];
+		assert.equal(findParentChainBreak(records), null);
+	});
+
+	it("detects a dangling parent and reports how much CC would drop", () => {
+		// [0..1] are reachable only from each other; [2] grafts onto a uuid from a
+		// deleted session generation, so walking back from the leaf stops at [2].
+		const records = chain(["summary", null], ["kept", "summary"], ["orphan", "gone"], ["live", "orphan"]);
+		const found = findParentChainBreak(records);
+		assert.match(found, /chain break at record 2/);
+		assert.match(found, /missing parent gone/);
+		assert.match(found, /replay only 2 of 4 records/);
+		assert.match(found, /dropping everything before index 2/);
+	});
+
+	it("detects a parent-uuid cycle instead of looping forever", () => {
+		const records = chain(["a", "b"], ["b", "a"]);
+		assert.match(findParentChainBreak(records), /cycle/);
+	});
+
+	it("verifyWrittenSession surfaces a chain break", () => {
+		const records = [
+			{ sessionId: SID, type: "user", uuid: "root", parentUuid: null },
+			{ sessionId: SID, type: "user", uuid: "orphan", parentUuid: "missing" },
+		];
+		writeFileSync(path, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+		const warnings = verifyWrittenSession(path, SID, 2);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], /parent-uuid chain break/);
 	});
 });

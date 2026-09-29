@@ -36,6 +36,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createSession, openSession, repairToolPairing } from "cc-session-io";
+import { findParentChainBreak } from "../src/session-verify.js";
 
 const CWD = process.cwd();
 const MODEL = "claude-haiku-4-5";
@@ -411,6 +412,45 @@ test("CC writes each tool result of a parallel turn as its own transcript record
 
 	assert.deepEqual(perRecord, [1, 1],
 		`CC's transcript layout for parallel results changed: ${JSON.stringify(perRecord)}`);
+});
+
+test("every CC transcript record in the conversation graph carries a uuid", { timeout: 120_000 }, async () => {
+	// findParentChainBreak walks parentUuid from the leaf and skips records that
+	// carry no uuid, on the assumption they are CC's own bookkeeping and sit
+	// outside the conversation graph. If CC ever wrote a *conversation* record
+	// without a uuid, that skip would silently shorten the chain; if it wrote a
+	// bookkeeping type we do not know about, the skip is still right but the
+	// allowlist in the doc comment is stale. Both are pinned here against a
+	// transcript CC wrote entirely by itself.
+	const BOOKKEEPING = new Set(["last-prompt", "mode", "atis-latch", "queue-operation"]);
+	const calls = [];
+	const { init } = await collect(query({
+		prompt: "Call the alpha tool, then call the beta tool, then report both values.",
+		options: providerOptions({ mcpServers: toolServer([noArgTool("alpha"), noArgTool("beta")], calls) }),
+	}));
+	assert.ok(calls.length >= 1, `expected at least one tool call, got ${calls.length}`);
+
+	const jsonlPath = openSession({ sessionId: init.session_id, projectPath: CWD, claudeDir: process.env.CLAUDE_CONFIG_DIR }).jsonlPath;
+	const records = readFileSync(jsonlPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+
+	const uuidless = records.filter((r) => typeof r.uuid !== "string");
+	const unknown = [...new Set(uuidless.map((r) => r.type ?? "(no type)"))].filter((t) => !BOOKKEEPING.has(t));
+	assert.deepEqual(unknown, [],
+		`CC wrote uuid-less record types findParentChainBreak does not know about: ${JSON.stringify(unknown)}. `
+		+ `Either they are conversation records (the skip is now wrong) or the allowlist in src/session-verify.ts is stale.`);
+
+	for (const type of ["user", "assistant"]) {
+		const missing = records.filter((r) => r.type === type && typeof r.uuid !== "string");
+		assert.equal(missing.length, 0, `CC wrote ${missing.length} ${type} record(s) with no uuid`);
+	}
+
+	// The converse check: our walker must not manufacture a break on a transcript
+	// CC wrote unaided. A failure here means the skip rule itself is wrong, not
+	// that the bridge mislinked anything.
+	assert.equal(findParentChainBreak(records), null,
+		`findParentChainBreak reports a break in a transcript CC wrote by itself (${jsonlPath})`);
+
+	console.log(`    uuid-less bookkeeping records seen: ${JSON.stringify([...new Set(uuidless.map((r) => r.type))])}`);
 });
 
 test("repairToolPairing keeps every result only when they share one user message", { timeout: 30_000 }, () => {
