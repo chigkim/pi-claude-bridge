@@ -5,26 +5,22 @@
 // `session_before_compact` takeover, so without this each summary would forget
 // every file touched before the last one.
 //
-// The previous compaction's `details` lists can't say which files are recent: pi
-// sorts them alphabetically, and each one already holds the union of all the lists
-// before it. Trimming them "newest-first" therefore trimmed alphabetically, and the
-// paths that sort last never left. One session carried the same 102 of 132 paths
-// through every compaction for a week, 84 of them to files that no longer existed,
-// and some files under up to four spellings (`D:/x`, `D:\x`, `x`, ...).
+// As in pi's own carry-forward, nothing is capped: the lists name every file the
+// session touched that still exists. What made them grow before was dead paths and
+// duplicate spellings: one session carried 132 paths through every compaction for a
+// week, 84 of them to files that no longer existed, and some files under up to four
+// spellings (`D:/x`, `D:\x`, `x`, ...).
 //
-// So recency comes from the session itself. The branch still holds every tool call
-// since the session began, so we rank each file by when it was last touched, merge
-// every spelling of one file into one entry, and drop files that no longer exist.
-// The previous compaction's lists are used only for files the scan can't see.
+// So the files come from the session itself. The branch still holds every tool call
+// since the session began, so we take each file from its tool calls, merge every
+// spelling of one file into one entry (the newest spelling wins), and drop files
+// that no longer exist. The previous compaction's lists are used only for files the
+// scan can't see.
 
 import { statSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
-/** Cap on how many earlier file paths each list (read, modified) carries into the next
- *  summary. Paths touched in the span being summarized always stay and count toward it. */
-export const MAX_CARRIED_FILE_OPS = 64;
 
 export interface FileOpSets {
 	read: Set<string>;
@@ -128,8 +124,8 @@ function normalizeCurrent(fileOps: FileOpSets, cwd: string): Map<string, string>
 }
 
 /**
- * Add earlier files to the file sets pi is about to summarize from, most recently
- * touched first, up to MAX_CARRIED_FILE_OPS per list. Also rewrites the sets' own
+ * Add every earlier file that still exists to the file sets pi is about to summarize
+ * from. Also rewrites the sets' own
  * paths to one absolute spelling per file, so the lists pi computes from them never
  * name one file twice. Mutates `preparation.fileOps`.
  */
@@ -192,8 +188,6 @@ export function carryForwardFileOps(
 		else byFile.set(key, { path, modified });
 	}
 
-	let readCount = fileOps.read.size;
-	let modifiedCount = new Set([...fileOps.edited, ...(fileOps.written ?? [])]).size;
 	const stats: CarryForwardStats = { read: 0, modified: 0, candidates: byFile.size, missing };
 	for (const [key, file] of byFile) {
 		const shown = current.get(key);
@@ -201,18 +195,14 @@ export function carryForwardFileOps(
 			// Already in the span. Keep that it was modified earlier even if the span only read it.
 			if (file.modified && !fileOps.edited.has(shown) && !fileOps.written?.has(shown)) {
 				fileOps.edited.add(shown);
-				modifiedCount++;
 			}
 			continue;
 		}
-		if (file.modified ? modifiedCount >= MAX_CARRIED_FILE_OPS : readCount >= MAX_CARRIED_FILE_OPS) continue;
 		if (file.modified) {
 			fileOps.edited.add(file.path);
-			modifiedCount++;
 			stats.modified++;
 		} else {
 			fileOps.read.add(file.path);
-			readCount++;
 			stats.read++;
 		}
 		current.set(key, file.path);

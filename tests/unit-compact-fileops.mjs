@@ -21,7 +21,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const { carryForwardFileOps: carry, resolveToolPath, MAX_CARRIED_FILE_OPS: CAP } = await import("../src/compaction-file-ops.js");
+const { carryForwardFileOps: carry, resolveToolPath } = await import("../src/compaction-file-ops.js");
 
 let root;
 let seq = 0;
@@ -67,43 +67,21 @@ describe("carryForwardFileOps", () => {
 		assert.deepEqual(lists(p), { read: [a], modified: [b] });
 	});
 
-	it("keeps the most recently touched files, not the alphabetically last", () => {
-		// Names sort in the opposite order to when they were touched.
-		const names = Array.from({ length: CAP + 10 }, (_, i) => `rank-${String(CAP + 10 - i).padStart(3, "0")}.ts`);
-		const paths = files(...names);
-		const p = prep();
-		const stats = carry(paths.map(read), p, root);
-		assert.equal(stats.read, CAP);
-		assert.ok(p.fileOps.read.has(paths.at(-1)), "newest kept");
-		assert.ok(!p.fileOps.read.has(paths[0]), "oldest dropped");
+	it("carries every earlier file, as pi does, with no cap", () => {
+		const r = files(...Array.from({ length: 200 }, (_, i) => `all-r-${i}.ts`));
+		const m = files(...Array.from({ length: 200 }, (_, i) => `all-m-${i}.ts`));
+		const p = prep({ read: files("all-mine.ts") });
+		const stats = carry([...r.map(read), ...m.map(edit)], p, root);
+		assert.deepEqual(stats, { read: 200, modified: 200, candidates: 400, missing: 0 });
+		assert.equal(lists(p).read.length, 201);
+		assert.equal(lists(p).modified.length, 200);
 	});
 
-	it("ranks a file by its last touch, so reusing an old file keeps it", () => {
-		const paths = files(...Array.from({ length: CAP + 5 }, (_, i) => `retouch-${i}.ts`));
-		const p = prep();
-		carry([...paths.map(read), read(paths[0])], p, root);
-		assert.ok(p.fileOps.read.has(paths[0]));
-		assert.ok(!p.fileOps.read.has(paths[1]));
-	});
-
-	it("does not let the previous compaction's sorted lists decide recency", () => {
-		const paths = files(...Array.from({ length: CAP + 5 }, (_, i) => `sorted-${String(i).padStart(3, "0")}.ts`));
-		const newest = paths[0];
-		const p = prep();
-		carry([compaction(paths.slice(1), []), read(newest)], p, root);
-		assert.ok(p.fileOps.read.has(newest), "file touched after the compaction survives");
-	});
-
-	it("uses the previous compaction's lists for files no tool call explains, after everything else", () => {
+	it("uses the previous compaction's lists for files no tool call explains", () => {
 		const [fromDetails, fromScan] = files("details-only.ts", "scanned.ts");
 		const p = prep();
 		carry([compaction([fromDetails], []), read(fromScan)], p, root);
 		assert.deepEqual(lists(p).read, [fromDetails, fromScan].sort());
-
-		const filler = files(...Array.from({ length: CAP }, (_, i) => `filler-${i}.ts`));
-		const q = prep();
-		carry([compaction([fromDetails], []), ...filler.map(read)], q, root);
-		assert.ok(!q.fileOps.read.has(fromDetails), "ranked below every scanned file");
 	});
 
 	it("counts files from abandoned branches, as of when they were left", () => {
@@ -127,24 +105,6 @@ describe("carryForwardFileOps", () => {
 		const p = prep({ edited: [gone] });
 		carry([], p, root);
 		assert.deepEqual(lists(p).modified, [gone]);
-	});
-
-	it("never evicts the span's own files, and they count toward the cap", () => {
-		const mine = files(...Array.from({ length: 5 }, (_, i) => `mine-${i}.ts`));
-		const earlier = files(...Array.from({ length: CAP * 2 }, (_, i) => `earlier-${i}.ts`));
-		const p = prep({ read: mine });
-		carry(earlier.map(read), p, root);
-		assert.equal(p.fileOps.read.size, CAP);
-		for (const f of mine) assert.ok(p.fileOps.read.has(f), `${f} survived`);
-	});
-
-	it("caps read and modified separately", () => {
-		const r = files(...Array.from({ length: CAP + 3 }, (_, i) => `cap-r-${i}.ts`));
-		const m = files(...Array.from({ length: CAP + 3 }, (_, i) => `cap-m-${i}.ts`));
-		const p = prep();
-		carry([...r.map(read), ...m.map(edit)], p, root);
-		assert.equal(lists(p).read.length, CAP);
-		assert.equal(lists(p).modified.length, CAP);
 	});
 
 	it("keeps that a file was modified earlier when the span only read it", () => {

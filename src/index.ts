@@ -24,7 +24,7 @@ import {
 import { basePromptKey } from "./base-prompt.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
-import { carryForwardFileOps, MAX_CARRIED_FILE_OPS } from "./compaction-file-ops.js";
+import { carryForwardFileOps } from "./compaction-file-ops.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
@@ -2596,7 +2596,7 @@ export default function (pi: ExtensionAPI) {
 			const carried = carryForwardFileOps(event.branchEntries, event.preparation, ctx.cwd);
 			debug(
 				`compact takeover: carried forward earlier file ops read=${carried.read} modified=${carried.modified} ` +
-				`of ${carried.candidates} files (${carried.missing} no longer exist; cap ${MAX_CARRIED_FILE_OPS})`,
+				`of ${carried.candidates} files (${carried.missing} no longer exist)`,
 			);
 		} catch (err) {
 			debug("session_before_compact: file-op carry-forward failed; cancelling", err);
